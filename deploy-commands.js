@@ -1,48 +1,58 @@
-const { REST, Routes } = require('discord.js');
-const { clientId, guildId, token } = require('./config.json');
-const fs = require('node:fs');
-const path = require('node:path');
+// deploy-commands.js
+// Registers all commands in ./commands as guild commands (fast) or global (slow).
+require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+const { REST } = require('@discordjs/rest');
+const { Routes } = require('discord-api-types/v10');
 
-const commands = [];
-const foldersPath = path.join(__dirname, 'commands');
-const commandFiles = fs.readdirSync(foldersPath);
+const token = process.env.DISCORD_TOKEN;
+const clientId = process.env.APP_ID || process.env.CLIENT_ID; // set on Render
+const guildId = process.env.GUILD_ID; // optional: for guild-scoped commands (fast)
 
-for (const file of commandFiles) {
-    const filePath = path.join(foldersPath, file);
-    const stat = fs.statSync(filePath);
-    if (stat.isDirectory()) {
-        // Skip processing if the file is a directory
-        continue;
-    }
-    if (file.endsWith('.js')) {
-        const command = require(filePath);
-        if ('data' in command && 'execute' in command) {
-            commands.push(command.data.toJSON());
-		}
-		else {
-            console.log(`[WARNING] The command at ${filePath} is missing a required "data" or "execute" property.`);
-        }
-    }
+if (!token || !clientId) {
+  console.error('Missing DISCORD_TOKEN or APP_ID/CLIENT_ID in env. Aborting.');
+  process.exit(1);
 }
 
-// Construct and prepare an instance of the REST module
-const rest = new REST().setToken(token);
+const commands = [];
+const commandsPath = path.join(__dirname, 'commands');
+if (!fs.existsSync(commandsPath)) {
+  console.error('No commands folder found. Nothing to register.');
+  process.exit(0);
+}
 
-// and deploy your commands!
+for (const file of fs.readdirSync(commandsPath).filter(f => f.endsWith('.js'))) {
+  const command = require(path.join(commandsPath, file));
+  if (command && command.data) {
+    // command.data should be a SlashCommandBuilder or an object with toJSON()
+    commands.push(command.data.toJSON ? command.data.toJSON() : command.data);
+  }
+}
+
+const rest = new REST({ version: '10' }).setToken(token);
+
 (async () => {
-	try {
-		console.log(`Started refreshing ${commands.length} application (/) commands.`);
+  try {
+    console.log(`Started refreshing ${commands.length} application (/) commands.`);
 
-		// The put method is used to fully refresh all commands in the guild with the current set
-		const data = await rest.put(
-			Routes.applicationGuildCommands(clientId, guildId),
-			{ body: commands },
-		);
-
-		console.log(`Successfully reloaded ${data.length} application (/) commands.`);
-	}
- catch (error) {
-		// And of course, make sure you catch and log any errors!
-		console.error(error);
-	}
+    if (guildId) {
+      // Guild commands update instantly — good for dev
+      await rest.put(
+        Routes.applicationGuildCommands(clientId, guildId),
+        { body: commands },
+      );
+      console.log(`Successfully registered commands for guild ${guildId}.`);
+    } else {
+      // Global commands can take up to 1 hour to propagate
+      await rest.put(
+        Routes.applicationCommands(clientId),
+        { body: commands },
+      );
+      console.log('Successfully registered global commands.');
+    }
+  } catch (error) {
+    console.error('Failed to register commands:', error);
+    process.exit(1);
+  }
 })();
