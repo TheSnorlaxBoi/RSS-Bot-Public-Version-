@@ -27,7 +27,12 @@ if (!DATABASE_URL) {
 }
 
 const parser = new Parser({ customFields: { item: ['media:content', 'enclosure'] } });
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = new Pool({ 
+  connectionString: DATABASE_URL,
+  max: 2,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 client.commands = new Collection();
 
