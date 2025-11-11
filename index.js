@@ -8,6 +8,7 @@ const { Pool } = require('pg');
 const Parser = require('rss-parser');
 const fs = require('fs');
 const path = require('path');
+const shutdown = require("./shutdown.js");
 
 // config.json fallback (local dev)
 let cfg = {};
@@ -35,6 +36,13 @@ const pool = new Pool({
 });
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 client.commands = new Collection();
+
+client.on("messageCreate", async (message) => {
+  if (message.content === "!shutdown" && message.author.id === "549257309113679912") {
+    await message.reply("⚠️ Shutting down...");
+    await shutdown(client, "Command-triggered shutdown");
+  }
+});
 
 async function fetchFeedWithBrowserHeaders(url) {
   try {
