@@ -36,6 +36,40 @@ const pool = new Pool({
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 client.commands = new Collection();
 
+async function fetchFeedWithBrowserHeaders(url) {
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        // Use a realistic browser user-agent
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://downloads.khinsider.com/',
+      },
+      redirect: 'follow',
+      // optionally set a timeout (node-fetch polyfills) — using AbortController if needed
+    });
+
+    if (res.status === 403) {
+      // Optional: try a second UA or log and bail
+      console.warn(`[feed] 403 for ${url}`);
+      return null;
+    }
+    if (!res.ok) {
+      console.warn(`[feed] ${res.status} ${res.statusText} for ${url}`);
+      return null;
+    }
+
+    const text = await res.text();
+    // parseString will return the same structure as parseURL
+    return await parser.parseString(text);
+  } catch (err) {
+    console.error(`[feed] fetch failed for ${url}:`, err?.message || err);
+    return null;
+  }
+}
+
 // load commands
 const commandsPath = path.join(__dirname, 'commands');
 if (fs.existsSync(commandsPath)) {
@@ -90,7 +124,8 @@ async function initializeBaselines() {
   const feeds = await getFeeds();
   for (const f of feeds) {
     try {
-      const data = await parser.parseURL(f.url);
+      const data = await fetchFeedWithBrowserHeaders(f.url);
+      if (!data) return; // or handle gracefully
       if (!data.items?.length) continue;
       data.items.sort((a, b) => getDate(b) - getDate(a));
       const latest = data.items[0];
