@@ -33,6 +33,9 @@ const pool = new Pool({
   max: 2,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 client.commands = new Collection();
