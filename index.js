@@ -34,8 +34,12 @@ const pool = new Pool({
     rejectUnauthorized: false
   },
   max: 2,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000
+  idleTimeoutMillis: 10000,       // kill idle conns fast
+  connectionTimeoutMillis: 10000, // allow slow wakeups
+  keepAlive: true
+});
+pool.on('error', (err) => {
+  console.error('🔥 Postgres pool error (ignored):', err.message);
 });
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 client.commands = new Collection();
@@ -103,6 +107,20 @@ async function ensureTable() {
       last_pub_date TEXT
     );
   `);
+}
+
+async function ensureTableWithRetry(retries = 5) {
+  while (retries--) {
+    try {
+      await ensureTable();   // ← calls your original function
+      console.log('✅ DB ready');
+      return;
+    } catch (err) {
+      console.warn('⏳ DB not ready, retrying...', err.message);
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+  throw new Error('❌ DB unavailable after retries');
 }
 
 async function getFeeds() {
@@ -192,7 +210,7 @@ async function fetchAndSend(feed) {
 // ---------- bot lifecycle ----------
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  await ensureTable();
+  await ensureTableWithRetry();
   await initializeBaselines();
 
   setInterval(async () => {
