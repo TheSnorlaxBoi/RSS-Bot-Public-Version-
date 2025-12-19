@@ -1,6 +1,7 @@
 // index.js
 // Render-ready: tiny Express server + env var fallbacks
 require('dotenv').config();
+require('dns').setDefaultResultOrder('ipv4first');
 
 const express = require('express');
 const { Client, Events, GatewayIntentBits, EmbedBuilder, Collection } = require('discord.js');
