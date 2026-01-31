@@ -1,5 +1,4 @@
 // index.js
-// Render-ready: tiny Express server + env var fallbacks
 require('dotenv').config();
 require('dns').setDefaultResultOrder('ipv4first');
 
@@ -9,214 +8,182 @@ const { Pool } = require('pg');
 const Parser = require('rss-parser');
 const fs = require('fs');
 const path = require('path');
-const shutdown = require("./shutdown.js");
+const shutdown = require('./shutdown.js');
 
-// config.json fallback (local dev)
+/* ---------------- config ---------------- */
+
 let cfg = {};
-try { cfg = require('./config.json'); } catch (e) { /* ignore if missing */ }
+try { cfg = require('./config.json'); } catch {}
 
 const TOKEN = process.env.DISCORD_TOKEN || cfg.token;
 const guildId = process.env.GUILD_ID || cfg.guildId;
-const DATABASE_URL = process.env.DATABASE_URL || cfg.databaseUrl || process.env.DATABASE_URL;
+const DATABASE_URL = process.env.DATABASE_URL || cfg.databaseUrl;
 
-if (!TOKEN) {
-  console.error('❌ No Discord token found. Set DISCORD_TOKEN env var or add token to config.json');
+if (!TOKEN || !DATABASE_URL) {
+  console.error('❌ Missing DISCORD_TOKEN or DATABASE_URL');
   process.exit(1);
 }
-if (!DATABASE_URL) {
-  console.error('❌ No DATABASE_URL found. Set DATABASE_URL env var (Postgres connection string).');
-  process.exit(1);
-}
+
+/* ---------------- clients ---------------- */
 
 const parser = new Parser({ customFields: { item: ['media:content', 'enclosure'] } });
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  },
+  ssl: { rejectUnauthorized: false },
   max: 2,
-  idleTimeoutMillis: 10000,       // kill idle conns fast
-  connectionTimeoutMillis: 10000, // allow slow wakeups
-  keepAlive: true
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 10000,
+  keepAlive: true,
 });
-pool.on('error', (err) => {
+
+pool.on('error', err => {
   console.error('🔥 Postgres pool error (ignored):', err.message);
 });
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+});
 client.commands = new Collection();
 
-client.on("messageCreate", async (message) => {
-  if (message.content === "!shutdown" && message.author.id === "549257309113679912") {
-    await message.reply("⚠️ Shutting down...");
-    await shutdown(client, "Command-triggered shutdown");
-  }
-});
+/* ---------------- command loader ---------------- */
 
-async function fetchFeedWithBrowserHeaders(url) {
-  try {
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        // Use a realistic browser user-agent
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://downloads.khinsider.com/',
-      },
-      redirect: 'follow',
-      // optionally set a timeout (node-fetch polyfills) — using AbortController if needed
-    });
-
-    if (res.status === 403) {
-      // Optional: try a second UA or log and bail
-      console.warn(`[feed] 403 for ${url}`);
-      return null;
-    }
-    if (!res.ok) {
-      console.warn(`[feed] ${res.status} ${res.statusText} for ${url}`);
-      return null;
-    }
-
-    const text = await res.text();
-    // parseString will return the same structure as parseURL
-    return await parser.parseString(text);
-  } catch (err) {
-    console.error(`[feed] fetch failed for ${url}:`, err?.message || err);
-    return null;
-  }
-}
-
-// load commands
 const commandsPath = path.join(__dirname, 'commands');
 if (fs.existsSync(commandsPath)) {
   for (const f of fs.readdirSync(commandsPath).filter(f => f.endsWith('.js'))) {
     const c = require(path.join(commandsPath, f));
-    if ('data' in c && 'execute' in c) client.commands.set(c.data.name, c);
+    if (c.data && c.execute) client.commands.set(c.data.name, c);
   }
 }
 
-const UPDATE_INTERVAL = 1000 * 60 * 5;
+/* ---------------- constants ---------------- */
 
-// ---------- database helpers ----------
-async function ensureTable() {
+const UPDATE_INTERVAL = 1000 * 60 * 5;
+let isCheckingFeeds = false; // execution lock
+
+/* ---------------- database ---------------- */
+
+async function ensureTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS feeds (
       id SERIAL PRIMARY KEY,
       url TEXT UNIQUE NOT NULL,
       channel_id TEXT NOT NULL,
-      last_sent_id TEXT,
       last_pub_date TEXT
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sent_items (
+      feed_url TEXT NOT NULL,
+      item_id TEXT NOT NULL,
+      sent_at TIMESTAMP DEFAULT now(),
+      UNIQUE (feed_url, item_id)
     );
   `);
 }
 
-async function ensureTableWithRetry(retries = 5) {
+async function ensureTablesWithRetry(retries = 5) {
   while (retries--) {
     try {
-      await ensureTable();   // ← calls your original function
+      await ensureTables();
       console.log('✅ DB ready');
       return;
-    } catch (err) {
-      console.warn('⏳ DB not ready, retrying...', err.message);
+    } catch (e) {
+      console.warn('⏳ DB not ready, retrying...', e.message);
       await new Promise(r => setTimeout(r, 5000));
     }
   }
-  throw new Error('❌ DB unavailable after retries');
+  throw new Error('DB unavailable');
 }
 
 async function getFeeds() {
   const res = await pool.query('SELECT * FROM feeds ORDER BY id');
   return res.rows;
 }
-async function updateFeed(url, id, pubDate) {
-  await pool.query(
-    'UPDATE feeds SET last_sent_id=$1, last_pub_date=$2 WHERE url=$3',
-    [id, pubDate, url]
-  );
+
+/* ---------------- rss helpers ---------------- */
+
+function getUniqueId(item) {
+  return item.guid || item.id || item.link || item.title;
 }
 
-// ---------- rss helpers ----------
-function getUniqueId(item) {
-  return item.link || item.guid || item.id || item.title;
-}
 function getDate(item) {
   return new Date(item.pubDate || item.isoDate || 0);
 }
+
 function extractImage(item) {
   if (item['media:content']?.$?.url) return item['media:content'].$.url;
   if (item.enclosure?.url) return item.enclosure.url;
-  const match = item.content?.match(/<img[^>]+src="([^">]+)"/i);
-  return match ? match[1] : null;
+  const m = item.content?.match(/<img[^>]+src="([^">]+)"/i);
+  return m ? m[1] : null;
 }
 
-// set initial baselines (no send)
-async function initializeBaselines() {
-  const feeds = await getFeeds();
-  for (const f of feeds) {
-    try {
-      const data = await fetchFeedWithBrowserHeaders(f.url);
-      if (!data) return; // or handle gracefully
-      if (!data.items?.length) continue;
-      data.items.sort((a, b) => getDate(b) - getDate(a));
-      const latest = data.items[0];
-      await updateFeed(f.url, getUniqueId(latest), latest.pubDate || latest.isoDate || null);
-      console.log(`[baseline] ${f.url} → ${latest.title}`);
-    } catch (e) {
-      console.error(`[baseline] ${f.url} failed: ${e.message}`);
-    }
-  }
+/* ---------------- dedupe insert ---------------- */
+
+async function markAsSent(feedUrl, itemId) {
+  const res = await pool.query(
+    `INSERT INTO sent_items (feed_url, item_id)
+     VALUES ($1, $2)
+     ON CONFLICT DO NOTHING`,
+    [feedUrl, itemId]
+  );
+  return res.rowCount === 1; // true = first time
 }
 
-// main fetch
+/* ---------------- fetch + send ---------------- */
+
 async function fetchAndSend(feed) {
-  try {
-    const data = await parser.parseURL(feed.url);
-    if (!data.items?.length) return;
-    const guild = client.guilds.cache.get(guildId);
-    if (!guild) return;
-    const channel = guild.channels.cache.get(feed.channel_id);
-    if (!channel) return;
+  const data = await parser.parseURL(feed.url);
+  if (!data.items?.length) return;
 
-    // sort oldest→newest
-    const items = data.items.sort((a, b) => getDate(a) - getDate(b));
-    const lastDate = feed.last_pub_date ? new Date(feed.last_pub_date) : null;
-    let sent = 0;
+  const guild = client.guilds.cache.get(guildId);
+  const channel = guild?.channels.cache.get(feed.channel_id);
+  if (!channel) return;
 
-    for (const item of items) {
-      const pub = getDate(item);
-      if (lastDate && pub <= lastDate) continue; // skip old or same-date
-      const embed = new EmbedBuilder()
-        .setColor(0x9877d7)
-        .setAuthor({ name: 'RSS Bot', iconURL: 'https://i.imgur.com/ukQ6Ukh.gif' })
-        .setTitle(item.title || 'Untitled')
-        .setURL(item.link)
-        .setDescription(item.contentSnippet?.slice(0, 300) || item.pubDate || '')
-        .setTimestamp(pub)
-        .setFooter({ text: data.title || feed.url });
+  const items = data.items.sort((a, b) => getDate(a) - getDate(b));
 
-      const img = extractImage(item);
-      if (img) embed.setImage(img);
+  for (const item of items) {
+    const itemId = getUniqueId(item);
+    if (!itemId) continue;
 
-      await channel.send({ embeds: [embed] });
-      await updateFeed(feed.url, getUniqueId(item), item.pubDate || item.isoDate || null);
-      sent++;
-    }
+    // 🔐 HARD DEDUPE (insert-before-send)
+    const shouldSend = await markAsSent(feed.url, itemId);
+    if (!shouldSend) continue;
 
-    if (sent) console.log(`✅ Sent ${sent} new from ${feed.url}`);
-  } catch (err) {
-    console.error(`❌ Fetch ${feed.url}: ${err.message}`);
+    const embed = new EmbedBuilder()
+      .setColor(0x9877d7)
+      .setTitle(item.title || 'Untitled')
+      .setURL(item.link)
+      .setDescription(item.contentSnippet?.slice(0, 300) || '')
+      .setTimestamp(getDate(item))
+      .setFooter({ text: data.title || feed.url });
+
+    const img = extractImage(item);
+    if (img) embed.setImage(img);
+
+    await channel.send({ embeds: [embed] });
+    console.log(`📨 Sent: ${item.title}`);
   }
 }
 
-// ---------- bot lifecycle ----------
+/* ---------------- lifecycle ---------------- */
+
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  await ensureTableWithRetry();
-  await initializeBaselines();
+  await ensureTablesWithRetry();
 
   setInterval(async () => {
-    const feeds = await getFeeds();
-    for (const f of feeds) await fetchAndSend(f);
+    if (isCheckingFeeds) return;
+    isCheckingFeeds = true;
+    try {
+      const feeds = await getFeeds();
+      for (const f of feeds) await fetchAndSend(f);
+    } catch (e) {
+      console.error('❌ Feed loop error:', e.message);
+    } finally {
+      isCheckingFeeds = false;
+    }
   }, UPDATE_INTERVAL);
 });
 
@@ -224,23 +191,15 @@ client.on(Events.InteractionCreate, async i => {
   if (!i.isChatInputCommand()) return;
   const cmd = client.commands.get(i.commandName);
   if (!cmd) return;
-  try {
-    await cmd.execute(i, pool);
-  } catch (err) {
-    console.error(err);
-    await i.reply({ content: 'Error executing command.', ephemeral: true });
-  }
+  await cmd.execute(i, pool);
 });
 
 client.login(TOKEN);
 
-// ---------- tiny Express keep-alive server ----------
+/* ---------------- keep-alive server ---------------- */
+
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-app.get('/', (req, res) => res.send('RSS Delivery Bot is running.'));
-app.get('/ping', (req, res) => res.send('pong'));
-
-app.listen(PORT, () => {
-  console.log(`🌐 Keep-alive server listening on port ${PORT}`);
-});
+app.get('/', (_, res) => res.send('RSS Bot running'));
+app.get('/ping', (_, res) => res.send('pong'));
+app.listen(PORT, () => console.log(`🌐 Listening on ${PORT}`));
