@@ -46,6 +46,29 @@ const client = new Client({
 });
 client.commands = new Collection();
 
+client.on('error', err => {
+  console.error('❌ Discord client error:', err);
+});
+
+client.on('shardError', err => {
+  console.error('❌ Discord shard error:', err);
+});
+
+client.on('disconnect', event => {
+  console.error('❌ Discord disconnected:', event);
+});
+
+client.on('debug', msg => {
+  if (
+    msg.includes('IDENTIFY') ||
+    msg.includes('READY') ||
+    msg.includes('RESUME') ||
+    msg.includes('Invalid')
+  ) {
+    console.log('[discord debug]', msg);
+  }
+});
+
 /* ---------------- command loader ---------------- */
 
 const commandsPath = path.join(__dirname, 'commands');
