@@ -1,5 +1,6 @@
 // index.js
 require('dotenv').config();
+console.log('🚀 index.js started');
 require('dns').setDefaultResultOrder('ipv4first');
 
 const express = require('express');
