@@ -200,11 +200,24 @@ client.once(Events.ClientReady, async () => {
   setInterval(async () => {
     if (isCheckingFeeds) return;
     isCheckingFeeds = true;
+
     try {
       const feeds = await getFeeds();
-      for (const f of feeds) await fetchAndSend(f);
-    } catch (e) {
-      console.error('❌ Feed loop error:', e.message);
+
+      for (const feed of feeds) {
+        try {
+          await fetchAndSend(feed);
+        } catch (err) {
+          console.error(
+            `❌ Feed failed (${feed.url}):`,
+            err instanceof AggregateError
+              ? err.errors.map(e => e.message)
+              : err.message
+          );
+        }
+      }
+    } catch (err) {
+      console.error('🔥 Fatal feed loop error:', err);
     } finally {
       isCheckingFeeds = false;
     }
